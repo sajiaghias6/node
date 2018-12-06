@@ -11,6 +11,7 @@
 #include "src/compiler/node.h"
 #include "src/compiler/osr.h"
 #include "src/compiler/pipeline.h"
+#include "src/macro-assembler.h"
 #include "src/optimized-compilation-info.h"
 
 namespace v8 {
@@ -38,7 +39,10 @@ std::ostream& operator<<(std::ostream& os, const CallDescriptor::Kind& k) {
       os << "Addr";
       break;
     case CallDescriptor::kCallWasmFunction:
-      os << "Wasm";
+      os << "WasmFunction";
+      break;
+    case CallDescriptor::kCallWasmImportWrapper:
+      os << "WasmImportWrapper";
       break;
   }
   return os;
@@ -129,6 +133,7 @@ int CallDescriptor::CalculateFixedFrameSize() const {
     case kCallCodeObject:
       return TypedFrameConstants::kFixedSlotCount;
     case kCallWasmFunction:
+    case kCallWasmImportWrapper:
       return WasmCompiledFrameConstants::kFixedSlotCount;
   }
   UNREACHABLE();
@@ -140,7 +145,7 @@ CallDescriptor* Linkage::ComputeIncoming(Zone* zone,
   if (!info->closure().is_null()) {
     // If we are compiling a JS function, use a JS call descriptor,
     // plus the receiver.
-    SharedFunctionInfo* shared = info->closure()->shared();
+    SharedFunctionInfo shared = info->closure()->shared();
     return GetJSCallDescriptor(zone, info->is_osr(),
                                1 + shared->internal_formal_parameter_count(),
                                CallDescriptor::kCanUseRoots);

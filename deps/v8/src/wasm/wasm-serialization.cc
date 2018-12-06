@@ -119,9 +119,8 @@ class Reader {
 
 constexpr size_t kVersionSize = 4 * sizeof(uint32_t);
 
-void WriteVersion(Isolate* isolate, Writer* writer) {
-  writer->Write(SerializedData::ComputeMagicNumber(
-      isolate->heap()->external_reference_table()));
+void WriteVersion(Writer* writer) {
+  writer->Write(SerializedData::kMagicNumber);
   writer->Write(Version::Hash());
   writer->Write(static_cast<uint32_t>(CpuFeatures::SupportedFeatures()));
   writer->Write(FlagList::Hash());
@@ -243,8 +242,8 @@ NativeModuleSerializer::NativeModuleSerializer(
             ->instruction_start();
     wasm_stub_targets_lookup_.insert(std::make_pair(addr, i));
   }
-  ExternalReferenceTable* table = isolate_->heap()->external_reference_table();
-  for (uint32_t i = 0; i < table->size(); ++i) {
+  ExternalReferenceTable* table = isolate_->external_reference_table();
+  for (uint32_t i = 0; i < ExternalReferenceTable::kSize; ++i) {
     Address addr = table->address(i);
     reference_table_lookup_.insert(std::make_pair(addr, i));
   }
@@ -268,6 +267,9 @@ size_t NativeModuleSerializer::Measure() const {
 }
 
 void NativeModuleSerializer::WriteHeader(Writer* writer) {
+  // TODO(eholk): We need to properly preserve the flag whether the trap
+  // handler was used or not when serializing.
+
   writer->Write(native_module_->num_functions());
   writer->Write(native_module_->num_imported_functions());
 }
@@ -380,19 +382,19 @@ WasmSerializer::WasmSerializer(Isolate* isolate, NativeModule* native_module)
       code_table_(native_module->SnapshotCodeTable()) {}
 
 size_t WasmSerializer::GetSerializedNativeModuleSize() const {
-  Vector<WasmCode* const> code_table(code_table_.data(), code_table_.size());
-  NativeModuleSerializer serializer(isolate_, native_module_, code_table);
+  NativeModuleSerializer serializer(isolate_, native_module_,
+                                    VectorOf(code_table_));
   return kVersionSize + serializer.Measure();
 }
 
 bool WasmSerializer::SerializeNativeModule(Vector<byte> buffer) const {
-  Vector<WasmCode* const> code_table(code_table_.data(), code_table_.size());
-  NativeModuleSerializer serializer(isolate_, native_module_, code_table);
+  NativeModuleSerializer serializer(isolate_, native_module_,
+                                    VectorOf(code_table_));
   size_t measured_size = kVersionSize + serializer.Measure();
   if (buffer.size() < measured_size) return false;
 
   Writer writer(buffer);
-  WriteVersion(isolate_, &writer);
+  WriteVersion(&writer);
 
   if (!serializer.Write(&writer)) return false;
   DCHECK_EQ(measured_size, writer.bytes_written());
@@ -501,8 +503,7 @@ bool NativeModuleDeserializer::ReadCode(uint32_t fn_index, Reader* reader) {
       }
       case RelocInfo::EXTERNAL_REFERENCE: {
         uint32_t tag = GetWasmCalleeTag(iter.rinfo());
-        Address address =
-            isolate_->heap()->external_reference_table()->address(tag);
+        Address address = isolate_->external_reference_table()->address(tag);
         iter.rinfo()->set_target_external_reference(address, SKIP_ICACHE_FLUSH);
         break;
       }
@@ -529,44 +530,34 @@ bool NativeModuleDeserializer::ReadCode(uint32_t fn_index, Reader* reader) {
   return true;
 }
 
-bool IsSupportedVersion(Isolate* isolate, Vector<const byte> version) {
+bool IsSupportedVersion(Vector<const byte> version) {
   if (version.size() < kVersionSize) return false;
   byte current_version[kVersionSize];
   Writer writer({current_version, kVersionSize});
-  WriteVersion(isolate, &writer);
+  WriteVersion(&writer);
   return memcmp(version.start(), current_version, kVersionSize) == 0;
 }
 
 MaybeHandle<WasmModuleObject> DeserializeNativeModule(
     Isolate* isolate, Vector<const byte> data, Vector<const byte> wire_bytes) {
-  if (!IsWasmCodegenAllowed(isolate, isolate->native_context())) {
-    return {};
-  }
-  if (!IsSupportedVersion(isolate, data)) {
-    return {};
-  }
+  if (!IsWasmCodegenAllowed(isolate, isolate->native_context())) return {};
+  if (!IsSupportedVersion(data)) return {};
+
   // TODO(titzer): module features should be part of the serialization format.
   WasmFeatures enabled_features = WasmFeaturesFromIsolate(isolate);
   ModuleResult decode_result = DecodeWasmModule(
       enabled_features, wire_bytes.start(), wire_bytes.end(), false,
       i::wasm::kWasmOrigin, isolate->counters(), isolate->allocator());
-  if (!decode_result.ok()) return {};
-  CHECK_NOT_NULL(decode_result.val);
-  WasmModule* module = decode_result.val.get();
+  if (decode_result.failed()) return {};
+  CHECK_NOT_NULL(decode_result.value());
+  WasmModule* module = decode_result.value().get();
   Handle<Script> script =
       CreateWasmScript(isolate, wire_bytes, module->source_map_url);
-
-  // TODO(eholk): We need to properly preserve the flag whether the trap
-  // handler was used or not when serializing.
-  UseTrapHandler use_trap_handler =
-      trap_handler::IsTrapHandlerEnabled() ? kUseTrapHandler : kNoTrapHandler;
-  ModuleEnv env(module, use_trap_handler,
-                RuntimeExceptionSupport::kRuntimeExceptionSupport);
 
   OwnedVector<uint8_t> wire_bytes_copy = OwnedVector<uint8_t>::Of(wire_bytes);
 
   Handle<WasmModuleObject> module_object = WasmModuleObject::New(
-      isolate, enabled_features, std::move(decode_result.val), env,
+      isolate, enabled_features, std::move(decode_result).value(),
       std::move(wire_bytes_copy), script, Handle<ByteArray>::null());
   NativeModule* native_module = module_object->native_module();
 
@@ -578,11 +569,8 @@ MaybeHandle<WasmModuleObject> DeserializeNativeModule(
   Reader reader(data + kVersionSize);
   if (!deserializer.Read(&reader)) return {};
 
-  // TODO(6792): Wrappers below might be cloned using {Factory::CopyCode}. This
-  // requires unlocking the code space here. This should eventually be moved
-  // into the allocator.
-  CodeSpaceMemoryModificationScope modification_scope(isolate->heap());
-  CompileJsToWasmWrappers(isolate, module_object);
+  CompileJsToWasmWrappers(isolate, native_module,
+                          handle(module_object->export_wrappers(), isolate));
 
   // Log the code within the generated module for profiling.
   native_module->LogWasmCodes(isolate);
